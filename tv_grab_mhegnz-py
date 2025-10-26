@@ -1,0 +1,862 @@
+#!/usr/bin/env python3
+
+NAME = 'tv_grab_mhegnz-py'
+VERSION = '0.4'
+DESCRIPTION = 'NZ MHEG-5 EPG data'
+
+'''
+tv_grab_mhegnz-py MHEG-5 EPG grabber module for TVHeadend.
+
+Much of this is derived from mhegepgsnoop.py, a Freeview DVB-T MHEG-5 to XMLTV EPG converter
+which was originally written by:
+
+David Moore <dmoo1790@ihug.co.nz> in 2011 with contributions from Bruce Wilson <acaferacer@gmail.com>
+Updates and coding to Python3 by Stephen Worthington <stephen@jsw.gen.nz>
+
+This module via eroyee on Github
+
+Several python modules (sqlite3, zlib, difflib, etc.) are required. There is no error-checking
+to confirm whether these modules are available on your system.
+
+The original script started as a Python port of the mheg2xmltv.sh bash script originally created by SolorVox 
+(see https://github.com/solorvox/mheg2xmltv) and updated by Stephen Worthington. 
+
+-------------------------------------------------------------------
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+'''
+
+extra_help='''
+This script collects and assembles DVB-T MHEG-5 EPG data from a DVB demux device, it then creates an 
+XML output that is imported to TVHeadend via the 'Internal XMLTV grabber' facility.
+
+Options are available to write the resultant XML data to a file, and to use a config file in order
+to specify the collected channels, and their naming convention. By itself the script will auto-name
+and collect all the available channels, you can then determine those you wish to use within TVH.
+
+In addition to the auto-collection I have written this to conform, more or less, to the XMLTV grabber requirements,
+(https://wiki.xmltv.org/index.php/XmltvCapabilities) so it *may* work with other systems that use this convention.
+That said, and because they don't seem to be needed in my application, the 'capabilities' are limited. Should it
+prove necessary they could be implemented.
+
+Importantly this has also been coded to avoid disk writes, which should assist in preserving SD-cards if 
+this is use in the likes of a RPi for example.
+
+No internet is required, the point of this is to be completely independent of the 'net. If you're able
+to receive terrrestrial broadcasts it should be able to extract the requisite EPG data, with the 
+proviso that a good signal will assist in reducing errors.
+
+Configuration should not be required for it to 'just work'. Simply place the file wherever your tv_grab*
+files should be ('/usr/bin/' maybe) and TVH should pick it up...
+
+The following examples show how you can run it standalone:
+
+Use the -v option to see a list of the broadcast channel names in the verbose output.
+
+Example usage to collect EPG data from default adapter and write to 'file.xml':
+	tv_grab_mhegnz-py --output /path/to/file.xml
+
+Example usage to collect EPG data from specified demux device and write to tvguide.xml:
+	tv_grab_mhegnz-py --output filename.xml -d "/dev/dvb/adapter1/demux0"
+
+Example usage to collect EPG data from specified demux device, write to tvguide.xml, use a channel map file, verbose output:
+	tv_grab_mhegnz-py --output filename.xml -d "/dev/dvb/adapter1/demux0" -v -f chanmap.txt
+
+Example usage to collect EPG data from default adapter, write to tvguide.xml, and strip some text from titles:
+	tv_grab_mhegnz-py --output filename.xml -c "All New |Movie: "
+	tv_grab_mhegnz-py --output filename.xml -c
+
+The default behaviour is to collect data from the default adapter0, auto-map channels, and output the result to STDOUT
+'''
+
+#---- Following code from linuxdvb module (see https://pypi.org/project/linuxdvb/#files) ---#
+
+"""
+Python bindings for Linux DVB API v5.1
+see headers in linux/dvb/ for reference
+"""
+import ctypes
+
+# the following 41 lines are copied verbatim from the python v4l2 binding
+
+_IOC_NRBITS = 8
+_IOC_TYPEBITS = 8
+_IOC_SIZEBITS = 14
+_IOC_DIRBITS = 2
+
+_IOC_NRSHIFT = 0
+_IOC_TYPESHIFT = _IOC_NRSHIFT + _IOC_NRBITS
+_IOC_SIZESHIFT = _IOC_TYPESHIFT + _IOC_TYPEBITS
+_IOC_DIRSHIFT = _IOC_SIZESHIFT + _IOC_SIZEBITS
+
+_IOC_NONE = 0
+_IOC_WRITE = 1
+_IOC_READ  = 2
+
+
+def _IOC(dir_, type_, nr, size):
+	return (
+		ctypes.c_int32(dir_ << _IOC_DIRSHIFT).value |
+		ctypes.c_int32(ord(type_) << _IOC_TYPESHIFT).value |
+		ctypes.c_int32(nr << _IOC_NRSHIFT).value |
+		ctypes.c_int32(size << _IOC_SIZESHIFT).value)
+
+def _IOC_TYPECHECK(t):
+	return ctypes.sizeof(t)
+
+
+def _IO(type_, nr):
+	return _IOC(_IOC_NONE, type_, nr, 0)
+
+
+def _IOW(type_, nr, size):
+	return _IOC(_IOC_WRITE, type_, nr, _IOC_TYPECHECK(size))
+
+
+def _IOR(type_, nr, size):
+	return _IOC(_IOC_READ, type_, nr, _IOC_TYPECHECK(size))
+
+
+def _IOWR(type_, nr, size):
+	return _IOC(_IOC_READ | _IOC_WRITE, type_, nr, _IOC_TYPECHECK(size))
+
+# end code cribbed from v4l2 binding
+
+def _binrange(start, stop):
+	'''returns a list of ints from start to stop in increments of one binary lshift'''
+	out = list()
+	out.append(start)
+	if start == 0:
+		start = 1
+		out.append(start)
+	while start < stop:
+		start = start << 1
+		out.append(start)
+	return out
+
+#
+# demux - see https://www.kernel.org/doc/html/latest/userspace-api/media/dvb/dvbapi.html 
+#
+
+DMX_FILTER_SIZE = 16
+
+class dmx_filter(ctypes.Structure):
+	_fields_ = [
+		('filter', ctypes.c_uint8 * DMX_FILTER_SIZE),
+		('mask', ctypes.c_uint8 * DMX_FILTER_SIZE),
+		('mode', ctypes.c_uint8 * DMX_FILTER_SIZE)
+	]
+
+class dmx_sct_filter_params(ctypes.Structure):
+	_fields_ = [
+		('pid', ctypes.c_uint16),
+		('filter', dmx_filter),
+		('timeout', ctypes.c_uint32),
+		('flags', ctypes.c_uint32)
+	]
+
+DMX_CHECK_CRC = 0x01
+DMX_ONESHOT = 0x02
+DMX_IMMEDIATE_START = 0x04
+DMX_KERNEL_CLIENT = 0x8000
+
+DMX_START = _IO('o', 41)
+DMX_STOP = _IO('o', 42)
+DMX_SET_BUFFER_SIZE = _IO('o', 45)
+DMX_SET_FILTER = _IOW('o', 43, dmx_sct_filter_params)
+
+#--------------------------------------------------------------------------------------------#
+
+#------------------------------------------ Start -------------------------------------------#
+
+try:
+	from xml.etree import cElementTree as ET
+except ImportError:
+	from xml.etree import ElementTree as ET
+import difflib, os, re, select, sqlite3, struct, sys, time, unicodedata, zlib, argparse, fcntl, traceback
+from subprocess import Popen, PIPE, STDOUT
+from array import array
+from io import StringIO
+#from datetime import datetime, timedelta
+
+def main():
+	global c, c2, unsquashed_modules, chanlist, channels, options, output, output_file
+	lines = []
+	unsquashed_modules = []
+	chanlist = []
+	channels = []
+	raw_tuning_info = []
+	output = StringIO()
+
+	icons = {'hd.png':'HDTV', 'dolby.png':'dolby', 'ear.png':'teletext'}
+	ratings = {'ao.png':'AO', 'g.png':'G', 'pgr.png':'PGR'}
+
+	class defaults:
+		demux_device = '/dev/dvb/adapter0/demux0'
+		extra_args = ''
+#		output_file = "/tmp/xmltv.xml" # Output filename
+		config_file = False # Channel map filename. Set to FALSE if -f option is not used.
+		verbosity = False
+		timezone = True
+		UTC = False
+		clean_titles = False
+	defs = defaults()
+
+	options = argparse_parse(defs)
+
+	verbose("Options selected = " + str(options))
+#	print (options.quiet)
+
+#---------------------- Need this to work as xmltv grabber for TVH ---------------------#
+#
+# TVH and xmltv grabber will interrogate tv_grab* in /bin/ for their capabilities and 
+# preferred method of delivery etc. Need to respond appropriately.
+# see: https://wiki.xmltv.org/index.php/XmltvCapabilities
+#
+# Presently this script isn't *completely* compliant with the requirements, but appears
+# sufficiently so now for TVH to run it and accept the output for import into the EPGDB
+#
+# ATM to be completely compliant it'd need to specifically ask for config details when run
+# with the appropriate flag, be fully 'quiet' when requested, and be able to traverse the 
+# requisite days of listings upon request. 
+#
+# Practically these don't appear necessary and have not been implemented. If it becomes
+# evident there's an issue I may code what's necessary. Otherwise let's just run with
+# it for the present.
+#
+	if options.capabilities:
+		print ("baseline")
+#		print ("manualconfig")
+#		print ("preferredmethod")
+#		print ("cache")
+		sys.exit(0)
+
+	if options.description:
+		print (DESCRIPTION)
+		sys.exit(0)
+
+	if options.preferredmethod:
+		print ("allatonce")
+		sys.exit(0)
+
+#---------------------------------------------------------------------------------------#
+
+#	today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+	if options.time_offset:
+		offset=1
+#		offset = timedelta(days=options.offset)
+#		start_listings = today + offset
+#		log.debug('Showing listings from %s' % start_listings)
+#	else:
+#		start_listings = today
+
+	if options.time_days:
+		days=1
+#		days = timedelta(days=options.days)
+#		end_listings = start_listings + days
+#		log.debug('Showing listings until %s' % end_listings)
+#	else:
+#		end_listings = None
+
+	# Set up database in memory to simplify handling shows crossing midnight
+	conn = sqlite3.connect(":memory:")
+	conn.text_factory = sqlite3.OptimizedUnicode	# need this to handle inserting unicode strings
+	conn.row_factory = sqlite3.Row
+	c = conn.cursor()
+	c2 = conn.cursor()
+	c.execute('''create table programs(start, stop, channel, title, desc,
+			episode_id, dolby_flag, teletext_flag, hd_flag, rating, start_time, local_start, local_stop)''')
+
+	datablocks = []
+	module_numbers = []
+	verbose("\nOpening read from device " + options.demux_device + " to collect data\n")
+	try:
+		dmxfd = open(options.demux_device, 'rb', 2*1024*1024)
+	except IOError as e:
+		(errno, strerr) = e.args
+		verbose("Could not open demux device " + options.demux_device + ". I/O error " + str(errno) + ": " + strerr + "\n")
+		sys.exit(1)
+	except:
+		verbose("Unexpected error: " + str(sys.exc_info()[0]))
+		sys.exit(1)
+	retval = fcntl.ioctl(dmxfd, DMX_SET_BUFFER_SIZE, 20*4096)
+	if retval != 0:
+		verbose('Unable to set DMX_SET_BUFFER_SIZE, returned value = ' + str(retval) + ', aborting')
+		sys.exit(1)
+	demux_filter = dmx_sct_filter_params()
+	the_pid = find_pid3(dmxfd, demux_filter)
+	if the_pid != -1:
+		download2(the_pid, datablocks, module_numbers, dmxfd, demux_filter)
+	else:
+		verbose("Could not find DSM-CC carousel PID.\n")
+		sys.exit(1)
+	dmxfd.close()
+
+	build_modules(datablocks, module_numbers)
+	lines = get_MHEG_data()
+	verbose("Extracting EPG info\n\n--- Channel Names ---\n")
+	parse_MHEG_data(lines, icons, ratings)
+	if options.config_file:
+		(chaninfo_map, chaninfo_db) = get_chan_info(options.config_file)
+		verbose("\nMatching MHEG channels to xmltv channels using map file\n")
+		map_channels(chaninfo_map)
+		delete_unmapped_channels()
+	else:
+		verbose("\nAuto-matching MHEG channels to xmltv channels\n")
+		auto_map_channels()
+		delete_unmapped_channels()
+	verbose("Fixing start/stop times for shows crossing midnight\n")
+	fix_midnight()
+#	verbose("Building XML file: " + output_file + "\n")
+	verbose("Building XML file..."+"\n")
+	build_xml()
+#	prettyup_xml()
+	if options.output_file:
+		fileout()
+	else:
+		prnout()
+	if options.clean_titles:
+		if isinstance(options.clean_titles, bool): # A hack to handle both argparse and optparse
+			options.clean_titles = 'All New '
+		do_clean_titles(options.clean_titles)
+	sys.exit(0)
+
+def argparse_parse(defs):
+	parser = argparse.ArgumentParser(epilog=extra_help, 
+									formatter_class=argparse.RawDescriptionHelpFormatter, 
+									description='Convert DVB-T MHEG EPG data to xmltv format for import into TVH EPG')
+	parser.add_argument('-d', dest='demux_device', action='store', default=defs.demux_device, 
+					help='Specify DVB demux device, e.g., "/dev/dvb/adapter1/demux0"')
+	parser.add_argument('-v', dest='verbosity', action='store_true', default=defs.verbosity,
+					help='Enable verbose output. Disable or redirect stdout & stderr to file if you get broken pipe error 32.')
+	parser.add_argument('-z', dest='timezone', action='store_true', default=defs.timezone, 
+					help='Generate local + offset program start/stop times (default local time)')
+	parser.add_argument('-u', dest='UTC', action='store_true', default=defs.UTC, 
+					help='Generate UTC start/stop times (default local time)')
+	parser.add_argument('-c', dest='clean_titles', nargs='?', const='All New ', default=defs.clean_titles,
+					help='''Clean up silly things prepended to titles. Default (just -c with no string specified) removes "All New ".
+					Customize the text to be removed by specifying a matching regular expression string like this: 
+					"Remove this|And this" or this: "Remove this".''')
+	parser.add_argument('--capabilities', dest='capabilities', action='store_true',
+				    help='show capabilities of this grabber (XMLTV compliant).')
+	parser.add_argument('--description', dest='description',action='store_true',
+				    help='show desciption of this grabber (XMLTV compliant).')
+	parser.add_argument('--preferredmethod', dest='preferredmethod', action='store_true',
+				    help='show the preferred download method of this grabber (XMLTV compliant).')
+	parser.add_argument('--output', '-o', dest='output_file', action='store',
+#					help='Output filename (default '+defs.output_file+')')
+					help='Output filename')
+	parser.add_argument('--config-file','-f', dest='config_file', action='store', default=defs.config_file,
+					help='At this point this file contains just channel maps (tab separated, default ' + str(defs.config_file) + ')')
+	parser.add_argument('--days', type=int, dest='time_days',
+					help='ouput data for DAYS days.')
+	parser.add_argument('--offset', type=int, dest='time_offset',
+					help='output data for day today plus OFFSET days.')
+	parser.add_argument('--version',  action='version', version=VERSION,
+					help='Version.')
+	parser.add_argument('--quiet', action='store_true',
+					help="Included for XMLTV validations purposes. Doesn\'t actually do anything since the default is to output nothing - unless the -v verbose option is used.")
+	args = parser.parse_args()
+	return args
+
+def get_chan_info(config_file):
+	chaninfo_map = []
+	chaninfo_db = []
+	# Get channel info from map file
+	verbose("\nGetting channel xmltv ids from map file " + config_file + "\n")
+	f = open(config_file)
+	chaninfo1 = f.readlines()
+	f.close()
+	for ch in chaninfo1:
+		verbose(ch)
+		chaninfo_map.append(ch.strip('\n').split('\t'))
+	return (chaninfo_map, chaninfo_db)
+
+def getFromList(theList, index):
+	if index >= 0 and index < len(theList):
+		result = theList[index]
+	else:
+		result = "Possible bad list index value: " + str(index)
+	return result
+
+def verbose(stuff):
+	if options.verbosity:
+		sys.stdout.write(stuff)
+		sys.stdout.flush()
+
+def which(prog):
+	for path in os.environ["PATH"].split(os.pathsep):
+		f = os.path.join(path, prog)
+		if os.path.exists(f) and os.access(f, os.X_OK):
+			return f
+	return None
+
+def find_pid3(dmxfd, demux_filter):
+	verbose("Getting program_map_pid from PAT\n")
+	program_map_pid = -1
+	demux_filter.pid = 0
+	fcntl.ioctl(dmxfd, DMX_SET_FILTER, demux_filter)
+	fcntl.ioctl(dmxfd, DMX_START)
+	r, w, e = select.select([dmxfd], [] , [], 2)
+	if not dmxfd in r:
+		dmxfd.close()
+		print('Timeout reading from ' + options.demux_device + ', exiting!')
+		exit(2)
+	buffer = dmxfd.read(3)
+	table_id = buffer[0]
+	b1 = buffer[1]
+	b2 = buffer[2]
+	sect_len = ((b1 & 0x0F) << 8) | b2
+	buffer += dmxfd.read(sect_len) # The remaining sect_len bytes in the section start immediately after sect_len.
+	program_map_pid = ((buffer[14] & 0x0F) << 8) | buffer[15] # Skip to the second program entry
+	verbose("program_map_pid = " + str(program_map_pid) + "\n")
+	fcntl.ioctl(dmxfd, DMX_STOP)
+
+	verbose("Getting carousel_pid from PMT\n")
+	carousel_pid = -1
+	demux_filter.pid = program_map_pid
+	fcntl.ioctl(dmxfd, DMX_SET_FILTER, demux_filter)
+	fcntl.ioctl(dmxfd, DMX_START)
+	buffer = dmxfd.read(3)
+	table_id = buffer[0]
+	b1 = buffer[1]
+	b2 = buffer[2]
+	sect_len = ((b1 & 0x0F) << 8) | b2
+	buffer += dmxfd.read(sect_len)
+	program_info_len =((buffer[10] & 0x0F) << 8) | buffer[11]
+	p = 11 + 1 + program_info_len
+	while p < sect_len - program_info_len - 12:
+		stream_type = buffer[p]
+		es_len = ((buffer[p+3] & 0x0F) << 8) | buffer[p+4]
+		if stream_type == 11:
+			carousel_pid = ((buffer[p+1] & 0x1F) << 8) | buffer[p+2]
+			verbose("carousel_pid = " + str(carousel_pid) + "\n")
+			break
+		p = p + 5 + es_len
+	fcntl.ioctl(dmxfd, DMX_STOP)
+	return carousel_pid
+
+def download2(pid, datablocks, module_numbers, dmxfd, demux_filter):
+	block_sizes = []
+	module_sizes = []
+	found_list = False
+	finished_download = False
+
+	demux_filter.pid = pid
+	fcntl.ioctl(dmxfd, DMX_SET_FILTER, demux_filter)
+	fcntl.ioctl(dmxfd, DMX_START)
+
+	while not finished_download:
+		buffer = dmxfd.read(3)
+		table_id = buffer[0]
+		b1 = buffer[1]
+		b2 = buffer[2]
+		sect_syntax_ind = (b1 & 0x80) >> 7
+		private_ind = (b1 & 0x40) >> 6
+		sect_len = ((b1 & 0x0F) << 8) | b2
+		buffer += dmxfd.read(sect_len)
+		message_id = (buffer[10] << 8) | buffer[11]
+		if table_id == 60:
+			module_id = (buffer[20] << 8) | buffer[21]
+			block_no = (buffer[24] << 8) | buffer[25]
+			downloaded = False
+			if len(datablocks) > 0 and len([blk for blk in datablocks if blk[0] == module_id and blk[1] == block_no]) > 0:
+				downloaded = True
+			if not downloaded and module_id != 0: # Module 0 does not contain EPG data and is not compressed
+				datablocks.append([module_id, block_no, buffer[26:len(buffer)-4]]) # Last 4 bytes are CRC
+				if found_list:
+					verbose("Blocks left to download = " + str(total_blocks - len(datablocks)) + "        \r")
+				else:
+					verbose("Started downloading blocks. Waiting for Download Message Block...\r")
+
+		elif table_id == 59 and message_id == 4098 and not found_list:
+			found_list = True
+			dsmcc_header_len = 12 # only if adaptation_length = 0
+			block_size = (buffer[8 + dsmcc_header_len + 4] << 8) | buffer[8 + dsmcc_header_len + 5]
+			no_of_modules = (buffer[8 + dsmcc_header_len + 18] << 8) | buffer[8 + dsmcc_header_len + 19]
+			verbose("\nblock_size = " + str(block_size) + " no_of_modules = " + str(no_of_modules) + "\n")
+			p = 8 + dsmcc_header_len + 20
+			total_blocks = 0
+			for i in range(0, no_of_modules):
+				module_id = (buffer[p] << 8) | buffer[p+1]
+				a = array('B', buffer[p+2:p+6])
+				module_size = struct.unpack(">I", a)[0]
+				module_info_len = buffer[p+7]
+				if module_id != 0: # Module 0 does not contain EPG data and is not compressed
+					verbose("module_id = " + str(module_id) + " module_size = " + str(module_size) + "\n")
+					module_numbers.append(module_id)
+					module_sizes.append(module_size)
+					total_blocks = total_blocks + module_size//block_size + (module_size % block_size > 0)
+				p = p + 8 + module_info_len
+			verbose("\nFound Download Message Block. " + str(total_blocks) + " blocks total to download...\n")
+
+		if found_list and len(datablocks) >= total_blocks:
+			finished_download = True
+
+	fcntl.ioctl(dmxfd, DMX_STOP)
+
+def build_modules(datablocks, module_numbers):
+	verbose("\nBuilding modules\n")
+	module_numbers.sort()
+	modules = []
+	datablocks.sort(key = lambda a: (a[0], a[1]))
+	starttime = time.time()
+	blki = iter(datablocks)
+	blk = next(blki)
+	for i in module_numbers:
+		bytestring = b''
+		try:
+			while blk[0] != i:
+				blk = next(blki)
+		except StopIteration:
+			break
+		try:
+			while blk[0] == i:
+				bytestring += blk[2]
+				blk = next(blki)
+		except StopIteration:
+			pass
+		modules.append([i, bytestring])
+	stoptime = time.time()
+
+	verbose("Decompressing modules\n")
+	for squashed in modules:
+		m = squashed[0]
+		if len(squashed[1]) > 0:
+			try:
+				verbose("Expanding module " + str(m) + " from " + str(len(squashed[1])) + " bytes to ")
+				unsquashed = zlib.decompress(squashed[1])
+				verbose(str(len(unsquashed)) + " bytes\n")
+			except Exception as e:
+				verbose("\nException on decompress:\n")
+				if not (options.quiet):				
+					print(e)
+					traceback.print_exc()
+					verbose("\nLooks like module " + str(m) + " is incomplete. Attempting partial decompression.\n")
+				try:
+					decom = zlib.decompressobj()
+					unsquashed = decom.decompress(squashed[1], 100000)
+					verbose("Possible successful partial decompression of module " + str(m) + "\n")
+				except Exception as e:
+					verbose("\nException on decompress:\n")
+				if not (options.quiet):
+					print(e)
+					traceback.print_exc()
+					verbose("Failed partial decompression of module " + str(m) + "\n")
+			build_modules2(unsquashed)
+		else:
+			verbose("No data downloaded for module " + str(m) + ".\n")
+
+def build_modules2(unsquashed):
+	zz = re.finditer(b'BIOP', unsquashed)  # Get a MatchObject containing all instances of "BIOP" in module
+	listo = []
+	for ll in zz:
+		v = ll.start() + 8  # Offset of message_size (32 bit uimsbf)
+		listo.append([ll.start(), int(struct.unpack(">I", unsquashed[v:v+4])[0]) + 12])
+
+	next_byte = listo[0][0]  # Following is messy to try and avoid possible spurious instances of the string "BIOP"
+	stringo = []			 # and also avoid some non-EPG messages with string "crid://" buried in them.
+	for k in listo:
+		if k[0] == next_byte:
+			end_byte = next_byte + k[1]
+			type_id_ofs = next_byte + 13 + ord(unsquashed[next_byte + 12:next_byte + 13]) + 4
+			if unsquashed[type_id_ofs:type_id_ofs + 3] == b"fil" and unsquashed[next_byte:next_byte + 130].find(b"crid://") != -1:
+				chunk = unsquashed[next_byte:end_byte]
+				chunk = re.sub(b'[\x0a\x0d]', b' ', chunk) # Get rid of CR/LF. Not needed in MythTV EPG.
+				chunk = re.sub(b'[\x04\x00]', b' ', chunk)
+				chunk = re.sub(b'\x1b[Cc]', b' ', chunk)
+				crido = chunk.find(b'crid://')  # Find suitable point before which we get rid of \x1c which is used for splitting
+				chunk = re.sub(b'\x1c', b'.', chunk[:crido]) + chunk[crido:] # so we don't accidentally split beginning of message
+				stringo.extend(chunk.split(b'\x1c'))
+			next_byte = end_byte
+	unsquashed_modules.append(stringo)
+
+def get_MHEG_data():
+	lines = []
+	# Loop through all the module files
+	for rawlines in unsquashed_modules:
+		# Loop through all the BIOP messages
+		for line in rawlines:
+			if line.startswith(b'BIOP'):
+				fields = line.split(b'\x1d')
+				l = len(fields) - 1
+				temp = b''
+				for i in range(0, 5):
+					temp = b'\x1d' + fields[l - i].strip() + temp
+					if i == 4:
+						# Get the date
+						t = time.localtime(time.time() - 10 * 24 * 3600) # time 10 days before now - use for Dec/Jan issue
+						t2 = time.strptime(str(t[0]) + str(t[1]).rjust(2,'0') + str(t[2]).rjust(2,'0'), "%Y%m%d")
+						theday = time.strptime(fields[l - i].strip().decode() + " " + time.strftime("%Y", t2), "%a %d %b %Y")
+						# Fix for data crossing from one year to the next
+						if theday >= t2:
+							thedate = time.strftime("%Y%m%d", theday)
+						else:
+							thedate = str(t2[0] + 1) + time.strftime("%m%d", theday)
+						lines.append(b'DAYdayDAYday' + thedate.encode())
+				lines.append(b'BIOP' + temp)
+			else:
+				lines.append(line)
+#	DEBUG
+#	with open("lines.txt", "w") as fd:
+#		fd.write (str(lines))
+	return lines
+
+def maketime(thedate):
+	if options.timezone:	# If times should be local + offset
+		mktimethedate = time.mktime(thedate)
+		if time.daylight and time.localtime(time.mktime(thedate)).tm_isdst:
+			offset = -time.altzone	# Seconds WEST of UTC. Negative means EAST of UTC.
+		else:
+			offset = -time.timezone	# Seconds WEST of UTC. Negative means EAST of UTC.
+		hh = int(offset/3600.0)	# Divide by float to get correct values for negatives
+		mm = round((offset - hh*3600)/60)
+		offset  = hh * 100 + mm
+		thetime = time.strftime("%Y%m%d%H%M00", time.localtime(time.mktime(thedate)))
+		thetime = thetime + ' {0:+5}'.format(offset)
+	elif options.UTC:	# If times should be UTC with no offset
+		thetime = time.strftime("%Y%m%d%H%M00", time.gmtime(time.mktime(thedate)))
+	else:	# If times should be local
+		thetime = time.strftime("%Y%m%d%H%M00", time.localtime(time.mktime(thedate)))
+	return thetime
+
+def parse_MHEG_data(lines, icons, ratings):
+	for line in lines:
+		fields = line.split(b'\x1d')
+		num_fields = len(fields)
+		showrec = []
+		if line.startswith(b'DAYdayDAYday'):
+			date = [int(line[12:16]), int(line[16:18]), int(line[18:20])]
+
+		# Get channel info if line starts with "BIOP" and contains "crid:" and update channels table if channel not already found
+		elif fields[0] == b'BIOP' and line.find(b'crid:') != -1:
+			chan = str(fields[2], encoding="utf-8")   # Can be funny characters in channel name
+			try:
+				i = chanlist.index(chan)
+			except:
+				chanlist.append(chan)
+				verbose(chan + "\n")
+
+		# Build the showrec list to create programme info to add to programs table
+		elif num_fields > 9 and fields[1]:
+			# TODO: Need to think more about handling daylight savings change
+			hh = int(int(fields[1]) / 3600)
+			mm = round((int(fields[1]) - (hh * 3600))/60)
+			date2 = []
+			date2.extend(date)
+			date2.extend([hh, mm, 0, 0, 0, -1])
+			start_time = maketime(tuple(date2))
+			local_start = time.strftime("%Y%m%d%H%M00", time.localtime(time.mktime(tuple(date2))))
+
+			hh = int(int(fields[2]) / 3600)
+			mm = round((int(fields[2]) - (hh * 3600))/60)
+			del date2[:]
+			date2.extend(date)
+			date2.extend([hh, mm, 0, 0, 0, -1])
+			end_time = maketime(tuple(date2))
+			local_end = time.strftime("%Y%m%d%H%M00", time.localtime(time.mktime(tuple(date2))))
+
+			fields[6] = fields[6].lstrip(b"/")
+			# unicode the title and description in case there are weird characters in them
+			showrec = [start_time, end_time, chan, str(fields[7], encoding="utf-8"), str(fields[8], encoding="utf-8"), str(fields[6], encoding='utf-8')]
+			for j in range(8, num_fields):
+				if fields[j].startswith(b"/") and fields[j].find(b".png") < 0:
+					fields[j] = fields[j].lstrip(b"/")
+			for k,v in sorted(icons.items()): # iteritems() sorting is apparently problematic so sort so we're sure of order
+				if line.find(k.encode()) != -1:
+					flag = v
+				else:
+					flag = "blank"
+				showrec.append(flag)
+			rating_found = False
+			for k,v in ratings.items():
+				if line.find(k.encode()) != -1:
+					rating_found = True
+					showrec.append(v)
+			if rating_found != True:
+				showrec.append("no rating")
+			showrec.append(str(fields[4], encoding='utf-8'))
+			showrec.append(local_start)
+			showrec.append(local_end)
+			c.execute("insert into programs values (?,?,?,?,?,?,?,?,?,?,?,?,?)", showrec)
+
+#	DEBUG
+#	with open("showrec.txt", "w") as fd:
+#		fd.write (str(showrec))
+
+def map_channels(chaninfo_map):
+	for line in chaninfo_map:
+		if len(line) == 2:
+			chan = line[0]
+			xmltvid = line[1]
+			channels.append([xmltvid, chan])
+			verbose('"' + chan + '" matched to xmltv ID "' + str(xmltvid) + '"\n')
+			t = (xmltvid, chan)
+			c.execute('update programs set channel=? where channel=?', t)
+
+def delete_unmapped_channels():
+	# Delete programs on channels which have not been mapped or matched.
+	c.execute('delete from programs where channel not in (' + ','.join('?'*len([t[0] for t in channels])) + ')', [t[0] for t in channels])
+
+def auto_map_channels():
+	for chan in chanlist:
+			xmltvid = (chan.replace(" +", "+").replace(" ", "-")+".mheg5")
+			channels.append([xmltvid, chan])
+			verbose('"' + chan + '" auto-matched to xmltv ID "' + str(xmltvid) + '"\n')
+			t = (xmltvid, chan)
+			c.execute('update programs set channel=? where channel=?', t)
+
+def fix_midnight():
+	# Find shows supposedly ending at midnight and check and fix the stop times
+	c.execute('select * from programs where local_stop like "%000000"')
+	for row in c:
+		t = (row['stop'], row['channel'])
+		# Look for a show starting at midnight same day, same channel
+		c2.execute('select * from programs where start=? and channel=?', t)
+		r2 = c2.fetchone()
+		if r2 != None:
+			if r2['title'] == row['title'] and r2['episode_id'] == row['episode_id']:
+				# Correct the program stop time if the show has same title and episode_id
+				t = (r2['stop'], r2['channel'], row['stop'])
+				c2.execute('update programs set stop=? where channel=? and stop=?', t)
+				# Delete the bogus duplicate record which starts at midnight
+				t = (r2['channel'], r2['start'], r2['stop'])
+				c2.execute('delete from programs where channel=? and start=? and stop=?', t)
+		else:
+			# Didn't find a show starting after this one so delete it because it is suspect.
+			# Cannot be sure about shows supposedly ending at midnight if there is no following
+			# show supposedly starting at midnight.
+			t = (row['channel'], row['start'], row['stop'])
+			c2.execute('delete from programs where channel=? and start=? and stop=?', t)
+
+	# Find shows starting at midnight and delete if start_time not "00:00"
+	c.execute('delete from programs where local_start like "%000000" and start_time != "00:00"')
+
+def build_xml():
+	# Build the xml doc
+	root_element = ET.Element("tv")
+	root_element.set("date", maketime(time.localtime()))
+	root_element.set("generator-info-name", "tv_grab_mhegnz-py " + VERSION)
+	root_element.set("source-info-name", "DVB-T MHEG Stream")
+
+	# Create the channel elements
+	channels.sort(key = lambda a: a[1].lower())
+	for r in channels:
+		ch = ET.Element("channel")
+		display_name = ET.Element("display-name")
+		ch.set("id", r[0])
+		display_name.text = r[1]
+		ch.append(display_name)
+		root_element.append(ch)
+
+	# Create the programme elements
+	c.execute('select distinct * from programs order by channel collate nocase, start')
+	for r in c:
+		try:
+			prog = ET.Element("programme")
+			root_element.append(prog)
+			prog.set("channel", r['channel'])
+			prog.set("start", r['start'])
+			prog.set("stop", r['stop'])
+			title = ET.Element("title")
+			title.text = r['title']
+			prog.append(title)
+			desc = ET.Element("desc")
+			desc.text = r['desc']
+			ep = re.search(r'\s\bS\d+\s\bE(?:p\d+|\d+)', desc.text) # Let's see if we can extract plain-text episode details
+			prog.append(desc)
+			if r['episode_id']:
+				episode = ET.Element("episode-num")
+				episode.text = r[5]
+				episode.set("system", "dd_progid")
+				prog.append(episode)
+			if ep:
+				episode = ET.Element("episode-num")
+				episode.text = ep.group(0).lstrip()
+				episode.set("system", "onscreen")
+				prog.append(episode)
+			if r['hd_flag'] == "HDTV":
+				video = ET.Element("video")
+				present = ET.Element("present")
+				quality = ET.Element("quality")
+				present.text = "yes"
+				quality.text = "HDTV"
+				video.append(present)
+				video.append(quality)
+				prog.append(video)
+			if r['dolby_flag'] == "dolby":
+				audio = ET.Element("audio")
+				stereo = ET.Element("stereo")
+				stereo.text = "dolby"
+				audio.append(stereo)
+				prog.append(audio)
+			if r['teletext_flag'] == "teletext":
+				subtitles = ET.Element("subtitles")
+				subtitles.set("type", "teletext")
+				prog.append(subtitles)
+			if r['rating'] != "no rating":
+				rating = ET.Element("rating")
+				rating.set("system", "Freeview")
+				value = ET.Element("value")
+				value.text = r[9]
+				rating.append(value)
+				prog.append(rating)
+
+		except:
+			prog = ET.Element("programme")
+			root_element.append(prog)
+			prog.set("foobar", "foobar")
+
+# ---------------- include header and output result to stringIO buffer ---------------#
+	tempfile = StringIO()
+	tempfile.write('<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE tv SYSTEM "xmltv.dtd">')
+	tempfile.write(ET.tostring(root_element, encoding="unicode", method="xml"))
+# ----------- do the following to pretty up (otherwise just one big line) ----------- #
+# ----------------- use of lxml or later ident may remove need? ----------------------#
+
+	for line in tempfile.getvalue().split('\n'):
+		line = re.sub("(<[/]*chan)", "\n\t\\1", line)
+		line = re.sub("(<displ|<icon|<tit|<desc|<epi|<subt)", "\n\t\t\\1", line)
+		line = re.sub("(<[/]*prog)", "\n\t\\1", line)
+		line = re.sub("(<[/]*rat)", "\n\t\t\\1", line)
+		line = re.sub("(<[/]*aud)", "\n\t\t\\1", line)
+		line = re.sub("(<[/]*vid)", "\n\t\t\\1", line)
+		line = re.sub("(<val|<pres|<qual|<ster)", "\n\t\t\t\\1", line)
+		line = re.sub("(</tv|<tv|<!DOCTYPE)", "\n\\1", line)
+		output.write(line)
+	tempfile.close()
+
+def prnout():
+	print (output.getvalue())
+	output.close()	
+
+def fileout():
+#	with open(options.output_file, "w") as f:
+#		output.seek(0)
+#		shutil.copyfileobj(output, f)
+	with open(options.output_file, mode='w') as f:
+		print(output.getvalue(), file=f)
+		output.close()	
+		f.close()
+
+def	do_clean_titles(clean_titles):
+	verbose('Stripping "' + clean_titles + '" from titles\n')
+	regex = re.compile('<title>(' + clean_titles + ')')
+	for line in fileinput.FileInput(output, inplace=1):
+		line = regex.sub('<title>', line)
+		sys.stdout.write(line) # Use sys.stdout.write to avoid extra new lines
+
+if __name__ == '__main__':
+	main()
